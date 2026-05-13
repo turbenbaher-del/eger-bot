@@ -28,14 +28,24 @@ db = firestore.client()
 
 # ── Config ──
 TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
-# Telegram-каналы для мониторинга (публичные username без @)
-CHANNELS_TO_MONITOR = [
+# Ключевые слова для автофильтра сообщений из чатов
+FISH_KEYWORDS = [
+    "поймал", "поймала", "улов", "клюёт", "клюет", "клёв", "клев",
+    "щука", "судак", "лещ", "карась", "сазан", "амур", "окунь",
+    "карп", "толстолоб", "берш", "жерех", "налим", "сом",
+    "рыбалка", "рыбачил", "спиннинг", "фидер", "поплавок",
+    "дон", "аксай", "донец", "цимла", "манычское",
+    "кг", "кило", "граммов", "штук", "хвостов",
+]
+
+# RSS-каналы для мониторинга
+RSS_CHANNELS = [
     "rybolov_don",
-    "fishing_rostov",
+    "fishing_rostov61",
     "don_rybalka",
-    "aksay_rybalka",
 ]
 
 # ── AI ответы ──
@@ -240,11 +250,89 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await subscribe_toggle(update, ctx)
 
 
-# ── Мониторинг каналов через RSS (rsshub) ──
-async def monitor_channels(app: Application):
+# ── Мониторинг чатов — фильтр сообщений ──
+def is_fishing_report(text: str) -> bool:
+    if not text or len(text) < 30:
+        return False
+    t = text.lower()
+    matches = sum(1 for kw in FISH_KEYWORDS if kw in t)
+    return matches >= 2
+
+async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message or update.channel_post
+    if not msg or not msg.text:
+        return
+
+    chat = msg.chat
+    text = msg.text
+
+    # Проверяем что чат в списке мониторинга
+    monitored = db.collection("monitored_chats").document(str(chat.id)).get()
+    if not monitored.exists:
+        return
+
+    if not is_fishing_report(text):
+        return
+
+    # Сохраняем как отчёт на сайт
+    sender = msg.from_user
+    name = sender.full_name if sender else chat.title or "Чат"
+
+    db.collection("reports").add({
+        "title": text[:80].split("\n")[0] or "Отчёт из чата",
+        "body": text[:1000],
+        "displayName": f"{name} (из {chat.title or 'чата'})",
+        "uid": f"tg_chat_{chat.id}",
+        "source": "telegram_chat",
+        "chat_title": chat.title or "",
+        "timestamp": firestore.SERVER_TIMESTAMP,
+    })
+    logger.info(f"Saved report from chat {chat.title}: {text[:50]}")
+
+
+# ── Команды управления чатами (только для админа) ──
+async def cmd_addchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if chat.type == "private":
+        await update.message.reply_text("❌ Команду нужно использовать в групповом чате")
+        return
+
+    db.collection("monitored_chats").document(str(chat.id)).set({
+        "title": chat.title,
+        "username": chat.username or "",
+        "added_by": user.id,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+    })
+    await update.message.reply_text(
+        f"✅ Чат *{chat.title}* добавлен в мониторинг!\n"
+        "Теперь я буду автоматически публиковать отчёты об уловах на сайте.",
+        parse_mode="Markdown"
+    )
+    logger.info(f"Added chat to monitoring: {chat.title} ({chat.id})")
+
+
+async def cmd_removechat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    db.collection("monitored_chats").document(str(chat.id)).delete()
+    await update.message.reply_text(f"❌ Чат *{chat.title}* удалён из мониторинга.", parse_mode="Markdown")
+
+
+async def cmd_listchats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID and ADMIN_ID != 0:
+        return
+    chats = db.collection("monitored_chats").stream()
+    lines = [f"• {c.to_dict().get('title','?')}" for c in chats]
+    text = "📋 *Мониторируемые чаты:*\n" + ("\n".join(lines) if lines else "_(пусто)_")
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ── Мониторинг RSS-каналов ──
+async def monitor_rss(app: Application):
     seen_ids = set()
     while True:
-        for channel in CHANNELS_TO_MONITOR:
+        for channel in RSS_CHANNELS:
             try:
                 url = f"https://rsshub.app/telegram/channel/{channel}"
                 feed = feedparser.parse(url)
@@ -253,11 +341,9 @@ async def monitor_channels(app: Application):
                     if entry_id in seen_ids:
                         continue
                     seen_ids.add(entry_id)
-
                     text = entry.get("summary", entry.get("title", ""))
                     if len(text) < 20:
                         continue
-
                     db.collection("news_telegram").add({
                         "channel": channel,
                         "title": entry.get("title", "")[:100],
@@ -266,11 +352,10 @@ async def monitor_channels(app: Application):
                         "published": entry.get("published", ""),
                         "timestamp": firestore.SERVER_TIMESTAMP,
                     })
-                    logger.info(f"Saved post from @{channel}: {entry.get('title','')[:50]}")
+                    logger.info(f"RSS: saved from @{channel}")
             except Exception as e:
-                logger.warning(f"Channel {channel} error: {e}")
-
-        await asyncio.sleep(3600)  # проверяем раз в час
+                logger.warning(f"RSS {channel}: {e}")
+        await asyncio.sleep(3600)
 
 
 # ── Утренние уведомления (06:00 МСК) ──
@@ -297,6 +382,15 @@ def main():
     app.add_handler(CommandHandler("forecast", forecast))
     app.add_handler(CommandHandler("subscribe", subscribe_toggle))
     app.add_handler(CommandHandler("unsubscribe", subscribe_toggle))
+    app.add_handler(CommandHandler("addchat", cmd_addchat))
+    app.add_handler(CommandHandler("removechat", cmd_removechat))
+    app.add_handler(CommandHandler("listchats", cmd_listchats))
+
+    # Мониторинг сообщений из групп и каналов
+    app.add_handler(MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL),
+        handle_group_message
+    ))
 
     # Отчёт (диалог)
     report_conv = ConversationHandler(
@@ -326,9 +420,9 @@ def main():
         name="morning_forecast"
     )
 
-    # Мониторинг каналов в фоне
+    # RSS мониторинг в фоне
     loop = asyncio.get_event_loop()
-    loop.create_task(monitor_channels(app))
+    loop.create_task(monitor_rss(app))
 
     logger.info("Егерь-бот запущен!")
     app.run_polling(drop_pending_updates=True)
