@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==20.7
+firebase-admin==6.4.0
+feedparser==6.0.11
+pytz==2024.1
