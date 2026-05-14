@@ -708,15 +708,24 @@ async def monitor_web_news(app: Application):
         "https://news.google.com/rss/search?q=рыболовство+запрет+нерест&hl=ru&gl=RU&ceid=RU:ru",
     ]
 
-    # Warm-up: seed seen IDs without sending notifications
+    # Warm-up: fetch RSS, save to Firestore immediately, seed seen_ids
     for feed_url in feeds:
         try:
             feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
-            for entry in feed.entries[:10]:
+            to_save = []
+            for entry in feed.entries[:8]:
                 eid = entry.get("link") or entry.get("id") or entry.get("title", "")
-                if eid: seen_ids.add(eid)
-        except Exception: pass
-    logger.info(f"Web news warm-up: {len(seen_ids)} IDs seeded")
+                title = entry.get("title", "")
+                if eid and title and eid not in seen_ids:
+                    seen_ids.add(eid)
+                    summary = re.sub(r'<[^>]+>', '', entry.get("summary", ""))[:220]
+                    pub = entry.get("published", "")
+                    to_save.append({"id": re.sub(r'[^\w]', '_', eid)[:100], "title": title, "link": entry.get("link", ""), "desc": summary})
+            if to_save:
+                await loop.run_in_executor(None, _save_news_items, to_save)
+        except Exception as e:
+            logger.warning(f"Warm-up error: {e}")
+    logger.info(f"Web news warm-up: {len(seen_ids)} IDs saved to Firestore")
 
     while True:
         await asyncio.sleep(10 * 60)
