@@ -80,6 +80,7 @@ FISH_KEYWORDS = [
 RSS_CHANNELS = ["rybolov_don","fishing_rostov61","don_rybalka"]
 
 REPORT_TITLE, REPORT_LOCATION, REPORT_FISH, REPORT_PHOTO, REPORT_TEXT = range(5)
+CATCH_FISH, CATCH_WEIGHT, CATCH_LOCATION, CATCH_PHOTO = range(5, 9)
 
 
 # ── Утилиты ──
@@ -337,7 +338,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Здорово, {user.first_name}! 🎣\n\n"
         "Я — *Егерь ИИ*, знаю каждый омут Дона и Ростовской области.\n\n"
         "Просто напиши вопрос о рыбалке — отвечу.\n"
-        "Или поделись 📍 геолокацией — дам прогноз и магазины прямо рядом с тобой!",
+        "Или поделись 📍 геолокацией — дам прогноз и магазины рядом!\n\n"
+        "*Команды дневника:*\n"
+        "🐟 /поймал — записать улов в дневник\n"
+        "📖 /дневник — последние 5 записей\n"
+        "🏆 /топ — топ-5 рыбаков недели\n"
+        "🏅 /турнир — актуальные турниры",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -608,6 +614,208 @@ async def report_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text("❌ Отчёт отменён.")
     return ConversationHandler.END
+
+
+# ── /поймал — личный дневник уловов ──
+FISH_TYPES_BOT = [
+    "судак","щука","сом","лещ","карп","карась","окунь","плотва","чехонь",
+    "толстолобик","белый амур","голавль","жерех","сазан","красноперка",
+    "берш","пиленгас","тарань","язь","линь","налим","форель","ёрш","другое",
+]
+
+async def catch_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = [[t] for t in FISH_TYPES_BOT[:12]]
+    kb.append(["другое"])
+    await update.message.reply_text(
+        "🐟 *Записываю улов!*\n\nШаг 1/4 — Какую рыбу поймал?",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
+    )
+    return CATCH_FISH
+
+
+async def catch_fish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["catch"] = {"fish": update.message.text.strip()}
+    await update.message.reply_text(
+        "⚖️ Шаг 2/4 — Вес улова в граммах:\n_(например: 1200 или 0 если не взвешивал)_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return CATCH_WEIGHT
+
+
+async def catch_weight(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        grams = int(float(text.replace(",", ".")) * (1000 if "." in text or "," in text else 1))
+        if grams > 200_000:
+            grams = int(float(text))
+    except ValueError:
+        grams = 0
+    ctx.user_data["catch"]["weight_g"] = grams
+    await update.message.reply_text(
+        "📍 Шаг 3/4 — Где ловил?\n_(название места или /skip)_",
+        parse_mode="Markdown"
+    )
+    return CATCH_LOCATION
+
+
+async def catch_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["catch"]["location"] = "" if update.message.text == "/skip" else update.message.text.strip()
+    await update.message.reply_text(
+        "📸 Шаг 4/4 — Пришли фото улова:\n_(или /skip)_",
+        parse_mode="Markdown"
+    )
+    return CATCH_PHOTO
+
+
+async def catch_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    c = ctx.user_data.get("catch", {})
+    photo_url = ""
+    if update.message.text != "/skip" and update.message.photo:
+        try:
+            photo = update.message.photo[-1]
+            file = await ctx.bot.get_file(photo.file_id)
+            bucket = storage.bucket()
+            blob = bucket.blob(f"catches/tg_{user.id}/{photo.file_id}.jpg")
+            blob.upload_from_string(bytes(await file.download_as_bytearray()), content_type="image/jpeg")
+            blob.make_public()
+            photo_url = blob.public_url
+        except Exception as e:
+            logger.warning(f"catch photo upload: {e}")
+
+    weight_g = c.get("weight_g", 0)
+    weight_str = f"{weight_g/1000:.1f} кг" if weight_g else "не указан"
+    record = {
+        "fishName": c.get("fish", ""),
+        "weightGrams": weight_g,
+        "locationName": c.get("location", ""),
+        "photoUrls": [photo_url] if photo_url else [],
+        "userId": f"tg_{user.id}",
+        "userName": user.full_name,
+        "source": "telegram",
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "isPublic": False,
+    }
+    db.collection("catches").document(f"tg_{user.id}").collection("records").add(record)
+
+    await update.message.reply_text(
+        f"✅ *Улов записан в дневник!*\n\n"
+        f"🐟 {c.get('fish','')}\n"
+        f"⚖️ {weight_str}\n"
+        f"📍 {c.get('location','—')}\n\n"
+        f"Смотри дневник: /дневник\n"
+        f"Или открой сайт 👉 https://turbenbaher-del.github.io/eger-ai/",
+        parse_mode="Markdown"
+    )
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+async def catch_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ Запись отменена.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ── /дневник ──
+async def cmd_diary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = f"tg_{user.id}"
+    try:
+        snap = (db.collection("catches").document(uid).collection("records")
+                .order_by("createdAt", direction=firestore.Query.DESCENDING).limit(5).get())
+    except Exception:
+        snap = []
+    if not snap:
+        await update.message.reply_text(
+            "📖 *Твой дневник пуст*\n\nДобавь первый улов командой /поймал",
+            parse_mode="Markdown"
+        )
+        return
+    lines = ["📖 *Твои последние уловы:*\n"]
+    for i, doc in enumerate(snap, 1):
+        d = doc.to_dict()
+        fish = d.get("fishName", "Рыба")
+        wg = d.get("weightGrams", 0)
+        w = f"{wg/1000:.1f} кг" if wg else ""
+        loc = d.get("locationName", "")
+        ts = d.get("createdAt")
+        date_str = ts.strftime("%d.%m") if hasattr(ts, "strftime") else ""
+        lines.append(f"{i}. *{fish}* {w} {('— '+loc) if loc else ''} {date_str}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /топ ──
+async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
+    since = datetime.now(pytz.utc) - timedelta(days=7)
+    try:
+        snap = (db.collection("reports")
+                .where("createdAt", ">=", since)
+                .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                .limit(200).get())
+    except Exception:
+        snap = []
+    tally: dict = {}
+    for doc in snap:
+        d = doc.to_dict()
+        uid = d.get("userId", d.get("uid", "anon"))
+        name = d.get("author", d.get("displayName", "Рыбак"))
+        kg = float(d.get("weight") or 0)
+        if uid not in tally:
+            tally[uid] = {"name": name, "catches": 0, "kg": 0.0}
+        tally[uid]["catches"] += 1
+        tally[uid]["kg"] += kg
+    ranked = sorted(tally.values(), key=lambda x: x["kg"], reverse=True)[:5]
+    if not ranked:
+        await update.message.reply_text("🏆 Нет данных за эту неделю. Стань первым — /поймал")
+        return
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+    lines = ["🏆 *Топ-5 рыбаков недели:*\n"]
+    for i, r in enumerate(ranked):
+        lines.append(f"{medals[i]} {r['name']} — {r['kg']:.1f} кг ({r['catches']} ул.)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── /турнир ──
+async def cmd_tournament(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(pytz.utc)
+    try:
+        snap = db.collection("tournaments").order_by("startDate").get()
+    except Exception:
+        snap = []
+    active, upcoming = [], []
+    for doc in snap:
+        d = {**doc.to_dict(), "id": doc.id}
+        start = d.get("startDate")
+        end = d.get("endDate")
+        if start and end:
+            s = start if hasattr(start, "replace") else start.replace(tzinfo=pytz.utc)
+            e = end if hasattr(end, "replace") else end.replace(tzinfo=pytz.utc)
+            try:
+                if s.replace(tzinfo=pytz.utc) <= now <= e.replace(tzinfo=pytz.utc):
+                    active.append(d)
+                elif s.replace(tzinfo=pytz.utc) > now:
+                    upcoming.append(d)
+            except Exception:
+                pass
+    if not active and not upcoming:
+        await update.message.reply_text(
+            "🏅 *Активных турниров нет*\n\nСледите за анонсами в новостях приложения!",
+            parse_mode="Markdown"
+        )
+        return
+    lines = []
+    for t in active:
+        lines.append(f"🟢 *{t.get('title','Турнир')}* — ИДЁТ\n📅 {t.get('endDate','')}\n{t.get('description','')}")
+    for t in upcoming[:3]:
+        lines.append(f"⏳ *{t.get('title','Турнир')}* — СКОРО\n📅 {t.get('startDate','')}")
+    await update.message.reply_text(
+        "🏅 *Турниры Егерь ИИ:*\n\n" + "\n\n".join(lines),
+        parse_mode="Markdown"
+    )
 
 
 # ── Мониторинг чатов ──
@@ -885,6 +1093,99 @@ async def monitor_web_news(app: Application):
             await loop.run_in_executor(None, _do_send_fcm, push_title, push_body, push_url)
 
 
+# ── Прогноз выходных (пятница 17:00 МСК) ──
+async def send_weekend_forecast(ctx: ContextTypes.DEFAULT_TYPE):
+    w = await fetch_weather(DEFAULT_LAT, DEFAULT_LON)
+    users = db.collection("bot_users").where("subscribed", "==", True).stream()
+    count = 0
+    for u in users:
+        if count >= 200:
+            break
+        data = u.to_dict()
+        try:
+            await ctx.bot.send_message(
+                chat_id=data["chat_id"],
+                text=(
+                    "🎣 *Прогноз на выходные!*\n\n"
+                    + build_forecast(w, "Ростов-на-Дону", DEFAULT_LAT, DEFAULT_LON)
+                    + "\n\n📱 Открыть приложение: https://turbenbaher-del.github.io/eger-ai/"
+                ),
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+            count += 1
+        except Exception as e:
+            logger.warning(f"Weekend push failed {data.get('chat_id')}: {e}")
+
+
+# ── Напоминание об улове (вторник 09:00 МСК) ──
+async def send_catch_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
+    cutoff = datetime.now(pytz.utc) - timedelta(days=5)
+    users = db.collection("bot_users").where("subscribed", "==", True).stream()
+    count = 0
+    for u in users:
+        if count >= 100:
+            break
+        data = u.to_dict()
+        uid = f"tg_{data.get('chat_id','')}"
+        try:
+            snap = (db.collection("catches").document(uid).collection("records")
+                    .order_by("createdAt", direction=firestore.Query.DESCENDING).limit(1).get())
+            has_recent = any(
+                (d.to_dict().get("createdAt") or pytz.utc.localize(datetime(2000,1,1))) >= cutoff
+                for d in snap
+            )
+            if not has_recent:
+                await ctx.bot.send_message(
+                    chat_id=data["chat_id"],
+                    text="🎣 Давно не рыбачил? Погода сегодня отличная! Добавь улов командой /поймал",
+                    parse_mode="Markdown"
+                )
+                count += 1
+        except Exception as e:
+            logger.warning(f"Catch reminder failed {data.get('chat_id')}: {e}")
+
+
+# ── Недельный дайджест (понедельник 08:00 МСК) ──
+async def send_weekly_digest(ctx: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
+    since = datetime.now(pytz.utc) - timedelta(days=7)
+    try:
+        snap = (db.collection("reports")
+                .where("createdAt", ">=", since)
+                .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                .limit(100).get())
+    except Exception:
+        snap = []
+
+    count_reports = len(list(snap))
+    w = await fetch_weather(DEFAULT_LAT, DEFAULT_LON)
+    season_tip = build_forecast(w, "Ростов-на-Дону", DEFAULT_LAT, DEFAULT_LON)
+
+    users = db.collection("bot_users").where("subscribed", "==", True).stream()
+    sent = 0
+    for u in users:
+        if sent >= 200:
+            break
+        data = u.to_dict()
+        try:
+            await ctx.bot.send_message(
+                chat_id=data["chat_id"],
+                text=(
+                    f"📊 *Дайджест недели Егерь ИИ*\n\n"
+                    f"📝 Отчётов за неделю: *{count_reports}*\n\n"
+                    f"{season_tip}\n\n"
+                    f"📱 https://turbenbaher-del.github.io/eger-ai/"
+                ),
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Weekly digest failed {data.get('chat_id')}: {e}")
+
+
 # ── Main ──
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -898,6 +1199,9 @@ def main():
     app.add_handler(CommandHandler("addchat", cmd_addchat))
     app.add_handler(CommandHandler("removechat", cmd_removechat))
     app.add_handler(CommandHandler("listchats", cmd_listchats))
+    app.add_handler(CommandHandler(["дневник", "diary"], cmd_diary))
+    app.add_handler(CommandHandler(["топ", "top"], cmd_top))
+    app.add_handler(CommandHandler(["турнир", "tournament"], cmd_tournament))
 
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
@@ -922,6 +1226,18 @@ def main():
     )
     app.add_handler(report_conv)
 
+    catch_conv = ConversationHandler(
+        entry_points=[CommandHandler(["поймал", "catch"], catch_start)],
+        states={
+            CATCH_FISH:     [MessageHandler(filters.TEXT & ~filters.COMMAND, catch_fish)],
+            CATCH_WEIGHT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, catch_weight)],
+            CATCH_LOCATION: [MessageHandler(filters.TEXT, catch_location)],
+            CATCH_PHOTO:    [MessageHandler(filters.PHOTO | filters.TEXT, catch_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", catch_cancel)],
+    )
+    app.add_handler(catch_conv)
+
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -929,6 +1245,27 @@ def main():
         send_morning_notifications,
         time=dtime(hour=3, minute=0, tzinfo=pytz.utc),
         name="morning_forecast"
+    )
+    # Пятница 14:00 UTC (17:00 МСК) — прогноз выходных
+    app.job_queue.run_daily(
+        send_weekend_forecast,
+        time=dtime(hour=14, minute=0, tzinfo=pytz.utc),
+        days=(4,),  # Friday
+        name="weekend_forecast"
+    )
+    # Вторник 06:00 UTC (09:00 МСК) — напоминание если нет уловов 5+ дней
+    app.job_queue.run_daily(
+        send_catch_reminder,
+        time=dtime(hour=6, minute=0, tzinfo=pytz.utc),
+        days=(1,),  # Tuesday
+        name="catch_reminder"
+    )
+    # Понедельник 05:00 UTC (08:00 МСК) — недельный дайджест
+    app.job_queue.run_daily(
+        send_weekly_digest,
+        time=dtime(hour=5, minute=0, tzinfo=pytz.utc),
+        days=(0,),  # Monday
+        name="weekly_digest"
     )
 
     loop = asyncio.get_event_loop()
