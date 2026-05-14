@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import re
 import logging
 import asyncio
 import aiohttp
@@ -17,7 +18,7 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore, storage, messaging as fcm
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -646,6 +647,77 @@ async def send_morning_notifications(ctx: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Notify failed {data.get('chat_id')}: {e}")
 
 
+# ── FCM push ──
+def _do_send_fcm(title: str, body: str, url: str):
+    try:
+        tokens = [d.id for d in db.collection("fcm_tokens").stream()]
+        if not tokens:
+            return
+        for i in range(0, len(tokens), 500):
+            batch = tokens[i:i+500]
+            resp = fcm.send_multicast(fcm.MulticastMessage(
+                notification=fcm.Notification(title=title, body=body),
+                data={"url": url},
+                tokens=batch,
+            ))
+            for j, r in enumerate(resp.responses):
+                if not r.success:
+                    try: db.collection("fcm_tokens").document(batch[j]).delete()
+                    except Exception: pass
+            logger.info(f"FCM: {resp.success_count}/{len(batch)} delivered")
+    except Exception as e:
+        logger.error(f"FCM send error: {e}")
+
+
+async def monitor_web_news(app: Application):
+    """Poll Google News RSS every 10 min, send FCM push on new items."""
+    seen_ids: set = set()
+    loop = asyncio.get_event_loop()
+    feeds = [
+        "https://news.google.com/rss/search?q=рыбалка+Ростов+Дон&hl=ru&gl=RU&ceid=RU:ru",
+        "https://news.google.com/rss/search?q=рыболовство+запрет+нерест&hl=ru&gl=RU&ceid=RU:ru",
+    ]
+
+    # Warm-up: seed seen IDs without sending notifications
+    for feed_url in feeds:
+        try:
+            feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
+            for entry in feed.entries[:10]:
+                eid = entry.get("link") or entry.get("id") or entry.get("title", "")
+                if eid: seen_ids.add(eid)
+        except Exception: pass
+    logger.info(f"Web news warm-up: {len(seen_ids)} IDs seeded")
+
+    while True:
+        await asyncio.sleep(10 * 60)
+        new_items = []
+        for feed_url in feeds:
+            try:
+                feed = await loop.run_in_executor(None, feedparser.parse, feed_url)
+                for entry in feed.entries[:8]:
+                    eid = entry.get("link") or entry.get("id") or entry.get("title", "")
+                    title = entry.get("title", "")
+                    if eid and eid not in seen_ids and title:
+                        seen_ids.add(eid)
+                        summary = re.sub(r'<[^>]+>', '', entry.get("summary", ""))[:120]
+                        new_items.append({"title": title, "link": entry.get("link", ""), "desc": summary})
+            except Exception as e:
+                logger.warning(f"Web news poll error: {e}")
+
+        if new_items:
+            if len(new_items) == 1:
+                n = new_items[0]
+                push_title = f"🎣 {n['title']}"
+                push_body  = n['desc']
+                push_url   = n['link'] or "https://turbenbaher-del.github.io/eger-ai/"
+            else:
+                push_title = f"🎣 Рыбалка: {len(new_items)} новых новостей"
+                push_body  = " · ".join(i['title'] for i in new_items[:3])[:120]
+                push_url   = "https://turbenbaher-del.github.io/eger-ai/"
+            logger.info(f"Web news: {len(new_items)} new → FCM push")
+            await loop.run_in_executor(None, _do_send_fcm, push_title, push_body, push_url)
+
+
 # ── Main ──
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -694,6 +766,7 @@ def main():
 
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_rss(app))
+    loop.create_task(monitor_web_news(app))
 
     logger.info("Егерь-бот запущен!")
     app.run_polling(drop_pending_updates=True)
