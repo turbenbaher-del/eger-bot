@@ -669,8 +669,38 @@ def _do_send_fcm(title: str, body: str, url: str):
         logger.error(f"FCM send error: {e}")
 
 
+def _classify_tag(title: str) -> str:
+    tl = title.lower()
+    if any(w in tl for w in ["запрет", "штраф"]): return "Запрет"
+    if any(w in tl for w in ["клёв", "клев", "улов"]): return "Клёв"
+    if "нерест" in tl: return "Нерест"
+    if "соревнован" in tl: return "Соревнования"
+    if any(w in tl for w in ["уровень", "паводок", "вода", "гидро"]): return "Гидрология"
+    return "Новости"
+
+
+def _save_news_items(items: list):
+    """Save new items to Firestore news collection (sync, called via executor)."""
+    try:
+        batch = db.batch()
+        for item in items:
+            ref = db.collection("news").document(item["id"])
+            batch.set(ref, {
+                "title": item["title"],
+                "text": item["desc"],
+                "link": item["link"],
+                "source": "Google Новости",
+                "tag": _classify_tag(item["title"]),
+                "timestamp": firestore.SERVER_TIMESTAMP,
+            })
+        batch.commit()
+        logger.info(f"Saved {len(items)} news items to Firestore")
+    except Exception as e:
+        logger.error(f"Firestore news save error: {e}")
+
+
 async def monitor_web_news(app: Application):
-    """Poll Google News RSS every 10 min, send FCM push on new items."""
+    """Poll Google News RSS every 10 min, save to Firestore and send FCM push."""
     seen_ids: set = set()
     loop = asyncio.get_event_loop()
     feeds = [
@@ -699,22 +729,31 @@ async def monitor_web_news(app: Application):
                     title = entry.get("title", "")
                     if eid and eid not in seen_ids and title:
                         seen_ids.add(eid)
-                        summary = re.sub(r'<[^>]+>', '', entry.get("summary", ""))[:120]
-                        new_items.append({"title": title, "link": entry.get("link", ""), "desc": summary})
+                        summary = re.sub(r'<[^>]+>', '', entry.get("summary", ""))[:220]
+                        pub = entry.get("published", "")
+                        try:
+                            from email.utils import parsedate_to_datetime
+                            date_str = parsedate_to_datetime(pub).strftime("%-d %B")
+                        except Exception:
+                            date_str = ""
+                        new_items.append({"id": re.sub(r'[^\w]', '_', eid)[:100], "title": title, "link": entry.get("link", ""), "desc": summary, "date": date_str})
             except Exception as e:
                 logger.warning(f"Web news poll error: {e}")
 
         if new_items:
+            # Save to Firestore (site reads via onSnapshot)
+            await loop.run_in_executor(None, _save_news_items, new_items)
+            # Send FCM push
             if len(new_items) == 1:
                 n = new_items[0]
                 push_title = f"🎣 {n['title']}"
-                push_body  = n['desc']
+                push_body  = n['desc'][:120]
                 push_url   = n['link'] or "https://turbenbaher-del.github.io/eger-ai/"
             else:
                 push_title = f"🎣 Рыбалка: {len(new_items)} новых новостей"
                 push_body  = " · ".join(i['title'] for i in new_items[:3])[:120]
                 push_url   = "https://turbenbaher-del.github.io/eger-ai/"
-            logger.info(f"Web news: {len(new_items)} new → FCM push")
+            logger.info(f"Web news: {len(new_items)} new → Firestore + FCM")
             await loop.run_in_executor(None, _do_send_fcm, push_title, push_body, push_url)
 
 
